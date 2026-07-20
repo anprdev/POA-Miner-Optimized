@@ -1,7 +1,7 @@
 /*
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2017 pooler
- *
+ * Updated By Git Copilot and Roland 2026
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
  * Software Foundation; either version 2 of the License, or (at your option)
@@ -126,6 +126,7 @@ static int opt_retries = -1;
 static int opt_fail_pause = 30;
 int opt_timeout = 0;
 static int opt_scantime = 5;
+static double opt_difficulty_multiplier = 1.0;
 static enum algos opt_algo = ALGO_SCRYPT;
 static int opt_scrypt_n = 1024;
 static int opt_n_threads;
@@ -184,6 +185,7 @@ Options:\n\
   -T, --timeout=N       timeout for long polling, in seconds (default: none)\n\
   -s, --scantime=N      upper bound on time spent scanning current work when\n\
                           long polling is unavailable, in seconds (default: 5)\n\
+      --difficulty-mult=N  multiplier for share difficulty (helps low hashrate) (default: 1.0)\n\
       --coinbase-addr=ADDR  payout address for solo mining\n\
       --coinbase-sig=TEXT  data to insert in the coinbase when possible\n\
       --no-longpoll     disable long polling support\n\
@@ -228,6 +230,7 @@ static struct option const options[] = {
 	{ "coinbase-sig", 1, NULL, 1015 },
 	{ "config", 1, NULL, 'c' },
 	{ "debug", 0, NULL, 'D' },
+	{ "difficulty-mult", 1, NULL, 1016 },
 	{ "help", 0, NULL, 'h' },
 	{ "no-gbt", 0, NULL, 1011 },
 	{ "no-longpoll", 0, NULL, 1003 },
@@ -789,7 +792,7 @@ static bool gpoabt_work_decode(const json_t *val, struct work *work)
 		work->hashPoAMerkleRoot[7 - i] = le32dec(hashPoAMerkleRoot + i);
 
 	//build integrated hash
-	char *integratedHashData = malloc(64);
+	unsigned char integratedHashData[64];
 	memcpy(integratedHashData, work->previousPoABlockHash, 32);
 	memcpy(integratedHashData + 32, work->hashPoAMerkleRoot, 32);
 	sha256d(integratedHash, integratedHashData, 64);
@@ -814,6 +817,7 @@ static bool gpoabt_work_decode(const json_t *val, struct work *work)
     //applog(LOG_INFO, "%s: strncpy", __func__);
     applog(LOG_INFO, "%s: pos_count = %d", __func__, pos_count);
 	//char *pos_data = malloc(pos_count * 40 * 2 + 1); //the size of posinfo = 40 byte
+	char *pos_data_ptr = work->pos_data + strlen(work->pos_data);
 	for (i = 0; i < pos_count; i++) {
 		const json_t *pos = json_array_get(pos_audited, i);
 		const char *pos_hex = json_string_value(json_object_get(pos, "data"));
@@ -821,8 +825,11 @@ static bool gpoabt_work_decode(const json_t *val, struct work *work)
 			applog(LOG_ERR, "JSON invalid PoS block info");
 			goto out;
 		}
-		strcat(work->pos_data, pos_hex);
+		size_t hex_len = strlen(pos_hex);
+		memcpy(pos_data_ptr, pos_hex, hex_len);
+		pos_data_ptr += hex_len;
 	}
+	*pos_data_ptr = '\0';
 
 	/* build coinbase transaction */
     //applog(LOG_INFO, "%s: build coinbase transaction", __func__);
@@ -1564,25 +1571,28 @@ static void *miner_thread(void *userdata)
 			     work.data[19] >= end_nonce)) {
 			    applog(LOG_INFO, "%s: mine over end nonce = %d", __func__, end_nonce);
 				work_free(&g_work);
+				pthread_mutex_unlock(&g_work_lock);
 				if (unlikely(!get_work(mythr, &g_work))) {
 					applog(LOG_ERR, "work retrieval failed, exiting "
 						"mining thread %d", mythr->id);
-					pthread_mutex_unlock(&g_work_lock);
 					goto out;
 				}
 				g_work_time = have_stratum ? 0 : time(NULL);
+				pthread_mutex_lock(&g_work_lock);
 			}
 			if (have_stratum) {
 				pthread_mutex_unlock(&g_work_lock);
 				continue;
 			}
 		}
+		/* Minimize lock hold time for work copy */
 		if (memcmp(work.data, g_work.data, 76)) {
 			work_free(&work);
 			work_copy(&work, &g_work);
 			work.data[19] = 0xffffffffU / opt_n_threads * thr_id;
-		} else
+		} else {
 			work.data[19]++;
+		}
 		pthread_mutex_unlock(&g_work_lock);
 		work_restart[thr_id].restart = 0;
 		
@@ -1654,11 +1664,14 @@ static void *miner_thread(void *userdata)
 		}
 
 		/* if nonce found, submit work */
-		if (rc && !opt_benchmark && !submit_work(mythr, &work))
-			break;
-        else if (!rc) {
-            applog(LOG_INFO, "%s: mine not successful", __func__);
-        }
+		if (rc && !opt_benchmark) {
+			if (!submit_work(mythr, &work)) {
+				applog(LOG_ERR, "submit_work failed");
+				break;
+			}
+		} else if (!rc) {
+			applog(LOG_DEBUG, "%s: mine not successful", __func__);
+		}
 
 	}
 
@@ -2160,6 +2173,13 @@ static void parse_arg(int key, char *arg, char *pname)
 			show_usage_and_exit(1);
 		}
 		strcpy(coinbase_sig, arg);
+		break;
+	case 1016:			/* --difficulty-mult */
+		opt_difficulty_multiplier = atof(arg);
+		if (opt_difficulty_multiplier < 0.1 || opt_difficulty_multiplier > 1000.0) {
+			fprintf(stderr, "%s: difficulty multiplier must be between 0.1 and 1000.0\n", pname);
+			show_usage_and_exit(1);
+		}
 		break;
 	case 'S':
 		use_syslog = true;
