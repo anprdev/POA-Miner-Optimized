@@ -511,4 +511,521 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		/* rest omitted for brevity... */
 	}
 
-	/* ... rest of file unchanged ... */
+	/* generate merkle root */
+	merkle_tree = malloc(32 * ((1 + tx_count + 1) & ~1));
+	size_t tx_buf_size = 32 * 1024;
+	tx = malloc(tx_buf_size);
+	sha256d(merkle_tree[0], cbtx, cbtx_size);
+	for (i = 0; i < tx_count; i++) {
+		tmp = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
+		const size_t tx_hex_len = tx_hex ? strlen(tx_hex) : 0;
+		const int tx_size = tx_hex_len / 2;
+		if (segwit) {
+			const char *txid = json_string_value(json_object_get(tmp, "txid"));
+			if (!txid || !hex2bin(merkle_tree[1 + i], txid, 32)) {
+				applog(LOG_ERR, "JSON invalid transaction txid");
+				goto out;
+			}
+			memrev(merkle_tree[1 + i], 32);
+		} else {
+			if (tx_size > tx_buf_size) {
+				free(tx);
+				tx_buf_size = tx_size * 2;
+				tx = malloc(tx_buf_size);
+			}
+			if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
+				applog(LOG_ERR, "JSON invalid transactions");
+				goto out;
+			}
+			sha256d(merkle_tree[1 + i], tx, tx_size);
+		}
+		if (!submit_coinbase) {
+			strcpy(txs_end, tx_hex);
+			txs_end += tx_hex_len;
+		}
+	}
+	free(tx); tx = NULL;
+	n = 1 + tx_count;
+	while (n > 1) {
+		if (n % 2) {
+			memcpy(merkle_tree[n], merkle_tree[n-1], 32);
+			++n;
+		}
+		n /= 2;
+		for (i = 0; i < n; i++)
+			sha256d(merkle_tree[i], merkle_tree[2*i], 64);
+	}
+
+	/* assemble block header */
+	work->data[0] = swab32(version);
+	for (i = 0; i < 8; i++)
+		work->data[8 - i] = le32dec(prevhash + i);
+	for (i = 0; i < 8; i++)
+		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
+	work->data[17] = swab32(curtime);
+	work->data[18] = le32dec(&bits);
+	memset(work->data + 19, 0x00, 52);
+	work->data[20] = 0x80000000;
+	work->data[31] = 0x00000280;
+
+	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
+		applog(LOG_ERR, "JSON invalid target");
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+		work->target[7 - i] = be32dec(target + i);
+
+	/* Apply difficulty multiplier to GBT target if requested */
+	if (opt_difficulty_multiplier != 1.0) {
+		int kk;
+		// find index k where target has non-zero word (k in 0..6)
+		for (kk = 0; kk <= 6; kk++)
+			if (work->target[kk] != 0)
+				break;
+		if (kk <= 6) {
+			uint64_t m = (uint64_t)work->target[kk] | ((uint64_t)work->target[kk+1] << 32);
+			double diff_reduced = 4294901760.0 / (double)m;
+			int exp = 6 - kk;
+			double diff = diff_reduced;
+			for (i = 0; i < exp; i++)
+				diff *= 4294967296.0;
+			double adj = diff * opt_difficulty_multiplier;
+			applog(LOG_INFO, "Applying difficulty multiplier %.4g -> adjusted diff %.8g (GBT)",
+				   opt_difficulty_multiplier, adj);
+			diff_to_target(work->target, adj);
+			/* log adjusted target in hex */
+			uint32_t target_be[8];
+			for (i = 0; i < 8; i++)
+				be32enc(target_be + i, work->target[7 - i]);
+			char target_hex[65];
+			bin2hex(target_hex, (unsigned char *)target_be, 32);
+			applog(LOG_INFO, "Adjusted GBT target: %s", target_hex);
+		}
+	}
+
+	char targetHex[2*32 + 1];
+	bin2hex(targetHex, target, 32);
+
+	tmp = json_object_get(val, "workid");
+	if (tmp) {
+		if (!json_is_string(tmp)) {
+			applog(LOG_ERR, "JSON invalid workid");
+			goto out;
+		}
+		work->workid = strdup(json_string_value(tmp));
+	}
+
+	/* Long polling */
+	tmp = json_object_get(val, "longpollid");
+	if (want_longpoll && json_is_string(tmp)) {
+		free(lp_id);
+		lp_id = strdup(json_string_value(tmp));
+		if (!have_longpoll) {
+			char *lp_uri;
+			tmp = json_object_get(val, "longpolluri");
+			lp_uri = strdup(json_is_string(tmp) ? json_string_value(tmp) : rpc_url);
+			have_longpoll = true;
+			tq_push(thr_info[longpoll_thr_id].q, lp_uri);
+		}
+	}
+
+	rc = true;
+
+out:
+	free(tx);
+	free(cbtx);
+	free(merkle_tree);
+	return rc;
+}
+
+/*
+ * PoA block has the following info
+ * version
+ * previouspoablockhash
+ * poamerkleroot
+ * coinbasetxn
+ * transactions
+ * coinbasevalue
+ * noncerange
+ * curtime
+ * bits
+ * height
+ * posblocksaudited {
+ *   {
+       "data": "3c8808918e261978f631dd810b14ed8881dfca595115d9a0d1d09b07cdb0656a",
+	 },...
+ * }
+ *
+ * work->data format: unit in uint32_t
+ * version: 1
+ * time: 1
+ * bits: 1
+ * nonce: 1
+ * hashMerkleRoot: 8
+ * hashPoAInterated: 8 ==> hash of hashPrevPoABlock and hashPoAMerkleRoot
+ * */
+static bool gpoabt_work_decode(const json_t *val, struct work *work)
+{
+	int i, n;
+	uint32_t version, curtime, bits;
+	uint32_t prevpoahash[8], hashPoAMerkleRoot[8], integratedHash[8];
+	uint32_t target[8];
+	int cbtx_size;
+	unsigned char *cbtx = NULL;
+    unsigned char *tx = NULL;
+	int tx_count, tx_size, pos_count, pos_size;
+	unsigned char txc_vi[9];
+	unsigned char(*merkle_tree)[32] = NULL;
+	bool coinbase_append = false;
+	bool submit_coinbase = false;
+	bool segwit = false;
+	json_t *tmp, *txa, *pos_audited;
+	bool rc = false;
+
+	tmp = json_object_get(val, "height");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid height");
+		goto out;
+	}
+	work->height = json_integer_value(tmp);
+    applog(LOG_INFO, "%s: Height = %d", __func__, work->height);
+
+	tmp = json_object_get(val, "version");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid version");
+		goto out;
+	}
+	version = json_integer_value(tmp);
+	work->version = version;
+    applog(LOG_INFO, "%s: Version = %d", __func__, work->version);
+
+	tmp = json_object_get(val, "curtime");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid curtime");
+		goto out;
+	}
+	curtime = json_integer_value(tmp);
+	work->time = curtime;
+
+	if (unlikely(!jobj_binary(val, "bits", &bits, sizeof(bits)))) {
+		applog(LOG_ERR, "JSON invalid bits");
+		goto out;
+	}
+	memcpy(&(work->bits), &bits, sizeof(bits));
+    applog(LOG_INFO, "%s: bits = %x", __func__, work->bits);
+
+	if (unlikely(!jobj_binary(val, "previouspoablockhash", prevpoahash, sizeof(prevpoahash)))) {
+		applog(LOG_ERR, "JSON invalid previouspoablockhash");
+		goto out;
+	}
+	for (i = 0; i < 8; i++)
+		work->previousPoABlockHash[7 - i] = le32dec(prevpoahash + i);
+
+	if (unlikely(!jobj_binary(val, "poamerkleroot", hashPoAMerkleRoot, sizeof(hashPoAMerkleRoot)))) {
+		applog(LOG_ERR, "JSON invalid poamerkleroot");
+		goto out;
+	}
+	for (i = 0; i < 8; i++)
+		work->hashPoAMerkleRoot[7 - i] = le32dec(hashPoAMerkleRoot + i);
+
+	//build integrated hash
+	unsigned char integratedHashData[64];
+	memcpy(integratedHashData, work->previousPoABlockHash, 32);
+	memcpy(integratedHashData + 32, work->hashPoAMerkleRoot, 32);
+	sha256d(integratedHash, integratedHashData, 64);
+	memcpy(work->integratedHash, integratedHash, 32);
+
+	/* find count and size of posblocksaudited  transactions */
+	pos_audited = json_object_get(val, "posblocksaudited");
+	if (!pos_audited || !json_is_array(pos_audited)) {
+		applog(LOG_ERR, "JSON invalid transactions");
+		goto out;
+	}
+	pos_count = json_array_size(pos_audited);
+    int n_pos = varint_encode(txc_vi, pos_count);
+    pos_size = pos_count * 40;
+    work->pos_data = malloc(2 * (n_pos + pos_size) + 1);
+    /*if (work->pos_data == NULL) {
+        applog(LOG_INFO, "%s: malloc pos data failed", __func__);
+    }*/
+    //applog(LOG_INFO, "%s: success work->pos_data malloc size = %d", __func__, 2 * (n_pos + pos_size) + 1);
+    //applog(LOG_INFO, "%s: copy txc_vi", __func__);
+    bin2hex(work->pos_data, txc_vi, n_pos);
+    //applog(LOG_INFO, "%s: strncpy", __func__);
+    applog(LOG_INFO, "%s: pos_count = %d", __func__, pos_count);
+	//char *pos_data = malloc(pos_count * 40 * 2 + 1); //the size of posinfo = 40 byte
+	char *pos_data_ptr = work->pos_data + strlen(work->pos_data);
+	for (i = 0; i < pos_count; i++) {
+		const json_t *pos = json_array_get(pos_audited, i);
+		const char *pos_hex = json_string_value(json_object_get(pos, "data"));
+		if (!pos_hex) {
+			applog(LOG_ERR, "JSON invalid PoS block info");
+			goto out;
+		}
+		size_t hex_len = strlen(pos_hex);
+		memcpy(pos_data_ptr, pos_hex, hex_len);
+		pos_data_ptr += hex_len;
+	}
+	*pos_data_ptr = '\0';
+
+	/* build coinbase transaction */
+    //applog(LOG_INFO, "%s: build coinbase transaction", __func__);
+	tmp = json_object_get(val, "coinbasetxn");
+	if (tmp) {
+		const char *cbtx_hex = json_string_value(json_object_get(tmp, "data"));
+        //applog(LOG_INFO, "%s: Found coinbasetxn, data = %s", __func__, cbtx_hex);
+		cbtx_size = cbtx_hex ? strlen(cbtx_hex) / 2 : 0;
+		cbtx = malloc(cbtx_size + 100);
+        applog(LOG_INFO, "%s: Malloc cbtx, size = %d", __func__, cbtx_size + 100);
+		if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
+			applog(LOG_ERR, "JSON invalid coinbasetxn");
+			goto out;
+		}
+        //applog(LOG_INFO, "%s: Success build coinbase", __func__);
+	} //PoA block always has a coinbasetxn, the following will possible be never executed
+	else {
+		int64_t cbvalue;
+		if (!pk_script_size) {
+			goto out;
+		}
+		tmp = json_object_get(val, "coinbasevalue");
+		if (!tmp || !json_is_number(tmp)) {
+			applog(LOG_ERR, "JSON invalid coinbasevalue");
+			goto out;
+		}
+		cbvalue = json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp);
+		cbtx = malloc(256);
+		le32enc((uint32_t *)cbtx, 1); /* version */
+		cbtx[4] = 1; /* in-counter */
+		memset(cbtx + 5, 0x00, 32); /* prev txout hash */
+		le32enc((uint32_t *)(cbtx + 37), 0xffffffff); /* prev txout index */
+		cbtx_size = 43;
+		/* BIP 34: height in coinbase */
+		for (n = work->height; n; n >>= 8) {
+			cbtx[cbtx_size++] = n & 0xff;
+			if (n < 0x100 && n >= 0x80)
+				cbtx[cbtx_size++] = 0;
+		}
+		cbtx[42] = cbtx_size - 43;
+		cbtx[41] = cbtx_size - 42; /* scriptsig length */
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0xffffffff); /* sequence */
+		cbtx_size += 4;
+		cbtx[cbtx_size++] = segwit ? 2 : 1; /* out-counter */
+		le32enc((uint32_t *)(cbtx + cbtx_size), (uint32_t)cbvalue); /* value */
+		le32enc((uint32_t *)(cbtx + cbtx_size + 4), cbvalue >> 32);
+		cbtx_size += 8;
+		cbtx[cbtx_size++] = pk_script_size; /* txout-script length */
+		memcpy(cbtx + cbtx_size, pk_script, pk_script_size);
+		cbtx_size += pk_script_size;
+
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0); /* lock time */
+		cbtx_size += 4;
+		coinbase_append = true;
+	}
+	if (coinbase_append) {
+		unsigned char xsig[100];
+		int xsig_len = 0;
+		if (*coinbase_sig) {
+			n = strlen(coinbase_sig);
+			if (cbtx[41] + xsig_len + n <= 100) {
+				memcpy(xsig+xsig_len, coinbase_sig, n);
+				xsig_len += n;
+			} else {
+				applog(LOG_WARNING, "Signature does not fit in coinbase, skipping");
+			}
+		}
+		tmp = json_object_get(val, "coinbaseaux");
+		if (tmp && json_is_object(tmp)) {
+			void *iter = json_object_iter(tmp);
+			while (iter) {
+				unsigned char buf[100];
+				const char *s = json_string_value(json_object_iter_value(iter));
+				n = s ? strlen(s) / 2 : 0;
+				if (!s || n > 100 || !hex2bin(buf, s, n)) {
+					applog(LOG_ERR, "JSON invalid coinbaseaux");
+					break;
+				}
+				if (cbtx[41] + xsig_len + n <= 100) {
+					memcpy(xsig+xsig_len, buf, n);
+					xsig_len += n;
+				}
+				iter = json_object_iter_next(tmp, iter);
+			}
+		}
+		if (xsig_len) {
+			unsigned char *ssig_end = cbtx + 42 + cbtx[41];
+			int push_len = cbtx[41] + xsig_len < 76 ? 1 :
+					       cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
+			n = xsig_len + push_len;
+			memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
+			cbtx[41] += n;
+			if (push_len == 2)
+				*(ssig_end++) = 0x4c; /* OP_PUSHDATA1 */
+			if (push_len)
+				*(ssig_end++) = xsig_len;
+			memcpy(ssig_end, xsig, xsig_len);
+			cbtx_size += n;
+		}
+	}
+
+	n = varint_encode(txc_vi, 1);
+	work->txs = malloc(2 * (n + cbtx_size) + 1);
+	bin2hex(work->txs, txc_vi, n);
+	bin2hex(work->txs + 2 * n, cbtx, cbtx_size);
+
+	/* generate merkle root */
+	merkle_tree = malloc(32 * ((1 + 1) & ~1));
+	size_t tx_buf_size = 32 * 1024;
+	tx = malloc(tx_buf_size);
+	sha256d(merkle_tree[0], cbtx, cbtx_size);
+	//PoA block has only one transaction: the coinbase transaction
+	/*for (i = 0; i < tx_count; i++) {
+		tmp = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
+		const int tx_size = tx_hex ? strlen(tx_hex) / 2 : 0;
+		if (segwit) {
+			const char *txid = json_string_value(json_object_get(tmp, "txid"));
+			if (!txid || !hex2bin(merkle_tree[1 + i], txid, 32)) {
+				applog(LOG_ERR, "JSON invalid transaction txid");
+				goto out;
+			}
+			memrev(merkle_tree[1 + i], 32);
+		}
+		else {
+			if (tx_size > tx_buf_size) {
+				free(tx);
+				tx_buf_size = tx_size * 2;
+				tx = malloc(tx_buf_size);
+			}
+			if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
+				applog(LOG_ERR, "JSON invalid transactions");
+				goto out;
+			}
+			sha256d(merkle_tree[1 + i], tx, tx_size);
+		}
+		if (!submit_coinbase) {
+			strcpy(txs_end, tx_hex);
+			txs_end += tx_hex_len;
+		}
+	}
+		free(tx); tx = NULL;
+	n = 1 + tx_count;
+	while (n > 1) {
+		if (n % 2) {
+			memcpy(merkle_tree[n], merkle_tree[n-1], 32);
+			++n;
+		}
+		n /= 2;
+		for (i = 0; i < n; i++)
+			sha256d(merkle_tree[i], merkle_tree[2*i], 64);
+	}
+	*/
+
+	/* assemble block header */
+	work->data[0] = swab32(version);
+	for (i = 0; i < 8; i++)
+		work->data[1 + i] = be32dec(integratedHash + i);
+	for (i = 0; i < 8; i++)
+		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
+	work->data[17] = swab32(curtime);
+	work->data[18] = le32dec(&bits);
+	memset(work->data + 19, 0x00, 52);
+	work->data[20] = 0x80000000;
+	work->data[31] = 0x00000280;
+
+	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
+		applog(LOG_ERR, "JSON invalid target");
+		goto out;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+		work->target[7 - i] = be32dec(target + i);
+
+	/* Apply difficulty multiplier to GPOABT target if requested */
+	if (opt_difficulty_multiplier != 1.0) {
+		int kk;
+		for (kk = 0; kk <= 6; kk++)
+			if (work->target[kk] != 0)
+				break;
+		if (kk <= 6) {
+			uint64_t m = (uint64_t)work->target[kk] | ((uint64_t)work->target[kk+1] << 32);
+			double diff_reduced = 4294901760.0 / (double)m;
+			int exp = 6 - kk;
+			double diff = diff_reduced;
+			for (i = 0; i < exp; i++)
+				diff *= 4294967296.0;
+			double adj = diff * opt_difficulty_multiplier;
+			applog(LOG_INFO, "Applying difficulty multiplier %.4g -> adjusted diff %.8g (GPOABT)",
+				   opt_difficulty_multiplier, adj);
+			diff_to_target(work->target, adj);
+			uint32_t target_be[8];
+			for (i = 0; i < 8; i++)
+				be32enc(target_be + i, work->target[7 - i]);
+			char target_hex[65];
+			bin2hex(target_hex, (unsigned char *)target_be, 32);
+			applog(LOG_INFO, "Adjusted GPOABT target: %s", target_hex);
+		}
+	}
+
+	char targetHex2[2*32 + 1];
+	bin2hex(targetHex2, target, 32);
+
+	tmp = json_object_get(val, "workid");
+	if (tmp) {
+		if (!json_is_string(tmp)) {
+			applog(LOG_ERR, "JSON invalid workid");
+			goto out;
+		}
+		work->workid = strdup(json_string_value(tmp));
+	}
+
+	//Temporarily disable polling
+	/* Long polling */
+	/*tmp = json_object_get(val, "longpollid");
+	if (want_longpoll && json_is_string(tmp)) {
+		free(lp_id);
+		lp_id = strdup(json_string_value(tmp));
+		if (!have_longpoll) {
+			char *lp_uri;
+			tmp = json_object_get(val, "longpolluri");
+			lp_uri = strdup(json_is_string(tmp) ? json_string_value(tmp) : rpc_url);
+			have_longpoll = true;
+			tq_push(thr_info[longpoll_thr_id].q, lp_uri);
+		}
+	}*/
+
+	rc = true;
+
+out:
+	free(cbtx);
+	free(merkle_tree);
+	return rc;
+}
+
+static void share_result(int result, const char *reason)
+{
+	char s[345];
+	double hashrate;
+	int i;
+
+	hashrate = 0.;
+	pthread_mutex_lock(&stats_lock);
+	for (i = 0; i < opt_n_threads; i++)
+		hashrate += thr_hashrates[i];
+	result ? accepted_count++ : rejected_count++;
+	pthread_mutex_unlock(&stats_lock);
+	
+	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.2f", 1e-3 * hashrate);
+	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s khash/s %s",
+		   accepted_count,
+		   accepted_count + rejected_count,
+		   100. * accepted_count / (accepted_count + rejected_count),
+		   s,
+		   result ? "(yay!!!)" : "(booooo)");
+
+	if (opt_debug && reason)
+		applog(LOG_DEBUG, "DEBUG: reject reason: %s", reason);
+}
+
+/* rest of file unchanged... */
